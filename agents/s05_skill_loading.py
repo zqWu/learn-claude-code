@@ -36,21 +36,19 @@ Key insight: "Don't put everything in the system prompt. Load on demand."
 """
 
 import os
+import json
 import re
 import subprocess
 import yaml
 from pathlib import Path
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = OpenAI()
 MODEL = os.environ["MODEL_ID"]
 SKILLS_DIR = WORKDIR / "skills"
 
@@ -184,28 +182,53 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"name": {"type": "string", "description": "Skill name to load"}}, "required": ["name"]}},
 ]
 
+OPENAI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": tool["name"],
+            "description": tool["description"],
+            "parameters": tool["input_schema"],
+        },
+    }
+    for tool in TOOLS
+]
+
 
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "system", "content": SYSTEM}] + messages,
+            tools=OPENAI_TOOLS,
+            max_completion_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        message = response.choices[0].message
+        tool_calls = message.tool_calls or []
+        assistant_message = {"role": "assistant", "content": message.content}
+        if tool_calls:
+            assistant_message["tool_calls"] = [{
+                "id": tool_call.id,
+                "type": tool_call.type,
+                "function": {
+                    "name": tool_call.function.name,
+                    "arguments": tool_call.function.arguments,
+                },
+            } for tool_call in tool_calls]
+        messages.append(assistant_message)
+        if not tool_calls:
             return
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}:")
-                print(str(output)[:200])
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-        messages.append({"role": "user", "content": results})
+        for tool_call in tool_calls:
+            name = tool_call.function.name
+            handler = TOOL_HANDLERS.get(name)
+            try:
+                tool_input = json.loads(tool_call.function.arguments or "{}")
+                output = handler(**tool_input) if handler else f"Unknown tool: {name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {name}:")
+            print(str(output)[:200])
+            messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": str(output)})
 
 
 if __name__ == "__main__":
@@ -220,7 +243,9 @@ if __name__ == "__main__":
         history.append({"role": "user", "content": query})
         agent_loop(history)
         response_content = history[-1]["content"]
-        if isinstance(response_content, list):
+        if isinstance(response_content, str):
+            print(response_content)
+        elif isinstance(response_content, list):
             for block in response_content:
                 if hasattr(block, "text"):
                     print(block.text)
